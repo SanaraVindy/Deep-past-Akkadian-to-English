@@ -1,0 +1,7 @@
+streamlit
+torch
+transformers>=4.30.0
+sentencepiece
+accelerate
+kagglehub
+pandas
