@@ -8,10 +8,54 @@ import base64
 import smtplib
 import random
 import string
+import pandas as pd
+import torch
 from email.mime.text import MIMEText
 from transformers import AutoTokenizer, T5ForConditionalGeneration
+from peft import PeftModel
+from pathlib import Path
 
-# --- 1. DATABASE & SECURITY ---
+# --- 1. OPTIMIZED ENGINE (Kaggle Logic) ---
+class OptimizedPreprocessor:
+    def __init__(self):
+        self.patterns = {
+            "big_gap": re.compile(r"(\.{3,}|…+|……)"),
+            "small_gap": re.compile(r"(xx+|\s+x\s+)"),
+        }
+
+    def preprocess_input_text(self, text: str) -> str:
+        if not text: return ""
+        cleaned_text = str(text)
+        cleaned_text = self.patterns["big_gap"].sub("<big_gap>", cleaned_text)
+        cleaned_text = self.patterns["small_gap"].sub("<gap>", cleaned_text)
+        return "translate Akkadian to English: " + cleaned_text
+
+class VectorizedPostprocessor:
+    def __init__(self, aggressive: bool = True):
+        self.aggressive = aggressive
+        self.subscript_trans = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+        self.special_chars_trans = str.maketrans("ḫḪ", "hH")
+        self.forbidden_chars = '!?()"——<>⌈⌋⌊[]+ʾ/;'
+        self.forbidden_trans = str.maketrans("", "", self.forbidden_chars)
+        self.whitespace = re.compile(r"\s+")
+        self.repeated_words = re.compile(r"\b(\w+)(?:\s+\1\b)+")
+
+    def clean(self, text: str) -> str:
+        if not text: return ""
+        s = text.translate(self.special_chars_trans)
+        s = s.translate(self.subscript_trans)
+        
+        if self.aggressive:
+            s = s.translate(self.forbidden_trans)
+            s = self.repeated_words.sub(r"\1", s)
+            # Fractions
+            s = re.sub(r"(\d+)\.5\b", r"\1½", s)
+            s = re.sub(r"\b0\.5\b", "½", s)
+        
+        s = self.whitespace.sub(" ", s).strip()
+        return s
+
+# --- 2. DATABASE & SECURITY ---
 def init_db():
     conn = sqlite3.connect('archives_access.db')
     c = conn.cursor()
@@ -43,7 +87,7 @@ def send_recovery_email(receiver_email, new_password):
 
 init_db()
 
-# --- 2. MINIMALIST THEME ENGINE ---
+# --- 3. MINIMALIST THEME ENGINE ---
 st.set_page_config(page_title="Deep Past Initiative", page_icon="📜", layout="wide")
 
 def set_professional_theme():
@@ -64,7 +108,6 @@ def set_professional_theme():
         .auth-box {{
             background: transparent !important;
             padding: 0px; 
-            border: none !important;
             margin: auto;
             max-width: 600px;
             text-align: center;
@@ -80,6 +123,8 @@ def set_professional_theme():
             display: flex;
             align-items: center;
             justify-content: center;
+            font-family: 'Source Code Pro', monospace;
+            font-size: 1.1rem;
         }}
 
         .stTextArea textarea {{
@@ -109,28 +154,43 @@ def set_professional_theme():
 
 set_professional_theme()
 
-# --- 3. MODEL LOADING ---
+# --- 4. MODEL LOADING ---
 @st.cache_resource
 def load_byt5():
     try:
-        os.environ['KAGGLE_USERNAME'] = "thevindimuhandiramge" 
-        os.environ['KAGGLE_KEY'] = "KGAT_2296bcbd3286473e9ae39386af74560e" 
-        path = kagglehub.model_download("thevindimuhandiramge/akkadian-byt5-final/pytorch/default")
+        # 1. Download (KaggleHub automatically handles caching)
+        base_path = kagglehub.model_download("thevindimuhandiramge/akkadian-byt5-final/pytorch/default")
         
-        model_path = path
-        for root, dirs, files in os.walk(path):
-            if "config.json" in files:
-                model_path = root
+        # 2. Find Adapter Folder
+        adapter_path = None
+        for root, dirs, files in os.walk(base_path):
+            if "adapter_config.json" in files:
+                adapter_path = root
                 break
-                
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = T5ForConditionalGeneration.from_pretrained(model_path)
+        
+        if not adapter_path:
+            st.error(f"Could not locate adapter weights in {base_path}")
+            return None, None
+
+        # 3. Load Tokenizer & Model
+        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+        base_model = T5ForConditionalGeneration.from_pretrained("google/byt5-base")
+        model = PeftModel.from_pretrained(base_model, adapter_path)
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        model.eval()
+        
         return tokenizer, model
     except Exception as e:
-        st.error(f"Inference Engine Error: {e}")
+        st.error(f"AI Engine Error: {e}")
         return None, None
 
-# --- 4. AUTHENTICATION LOGIC ---
+# Initialize Global Tools
+preprocessor = OptimizedPreprocessor()
+postprocessor = VectorizedPostprocessor(aggressive=True)
+
+# --- 5. AUTHENTICATION LOGIC ---
 if "auth" not in st.session_state:
     st.markdown('<br><br><br><h1 style="text-align:center; color:#d4af37; font-size:3.5rem; font-family:Playfair Display;">WELCOME TO THE DEEP PAST</h1>', unsafe_allow_html=True)
     _, col_mid, _ = st.columns([1, 2, 1])
@@ -196,7 +256,7 @@ if "auth" not in st.session_state:
             """, unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-# --- 5. WORKSPACE (LOGGED IN) ---
+# --- 6. WORKSPACE (LOGGED IN) ---
 else:
     tokenizer, model = load_byt5()
     st.markdown('<h1 style="text-align:center; color:#d4af37; font-size:3rem;">OLD ASSYRIAN TRANSLATOR</h1>', unsafe_allow_html=True)
@@ -204,7 +264,7 @@ else:
     with st.sidebar:
         st.markdown(f"### User: {st.session_state['user']}")
         with st.expander("ℹ️ About System"):
-            st.info("**Version:** 1.0.4\\n**Model:** ByT5-Base\\n**Project:** CIS 6005")
+            st.info("**Version:** 1.1.0 (Ultra-Optimized)\\n**Model:** ByT5 + PEFT Adapter\\n**Project:** CIS 6005")
 
         with st.expander("🔑 Change Access Key"):
             old_p = st.text_input("Current Key", type="password")
@@ -226,25 +286,45 @@ else:
             st.rerun()
 
     col_l, col_r = st.columns(2, gap="large")
+    
     with col_l:
         st.markdown("### 📜 Tablet Transliteration")
         src_text = st.text_area("Input transliteration...", height=400, key="main_input")
+        
         if st.button("⚜️ GENERATE"):
             if src_text.strip() and model:
                 with st.spinner("Decoding Ancient Bytes..."):
-                    prompt = "translate Old Assyrian to English: " + src_text
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-                    outputs = model.generate(inputs["input_ids"], num_beams=12, max_length=150)
-                    res = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    st.session_state['res'] = re.sub(r'\b(\w+)(?:\s+\1\b)+', r'\1', res)
+                    # Step 1: Preprocess (Kaggle Logic)
+                    prompt = preprocessor.preprocess_input_text(src_text)
+                    
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+                    
+                    # Step 2: Generation (Ultra-Optimized Beams)
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            input_ids=inputs["input_ids"], 
+                            num_beams=8, 
+                            max_new_tokens=512,
+                            length_penalty=1.3,
+                            early_stopping=True
+                        )
+                    
+                    # Step 3: Postprocess (Kaggle Logic)
+                    raw_decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    cleaned_result = postprocessor.clean(raw_decoded)
+                    
+                    st.session_state['res'] = cleaned_result
                     st.session_state['last_in'] = src_text
-                    st.rerun() # Critical: Forces refresh to show output
+                    st.rerun()
 
     with col_r:
         st.markdown("### 🏛️ Deciphered English")
         if 'res' in st.session_state:
             st.markdown(f'<div class="tablet-box">{st.session_state["res"]}</div>', unsafe_allow_html=True)
-            st.download_button("💾 DOWNLOAD", f"Input: {st.session_state.get('last_in')}\\nOutput: {st.session_state['res']}", "decipherment.txt")
+            st.download_button("💾 DOWNLOAD DECIPHERMENT", 
+                               f"Input Transliteration:\\n{st.session_state.get('last_in')}\\n\\nEnglish Decipherment:\\n{st.session_state['res']}", 
+                               "decipherment.txt")
         else:
             st.markdown('<div class="tablet-box" style="color:#666;">Awaiting input...</div>', unsafe_allow_html=True)
 
